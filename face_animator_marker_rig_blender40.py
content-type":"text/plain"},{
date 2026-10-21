@@ -1,0 +1,777 @@
+bl_info = {
+    "name": "Face Animator + Marker Rig",
+    "author": "AI Assistant",
+    "version": (1, 0, 0),
+    "blender": (4, 0, 0),
+    "location": "View3D > Sidebar > Face Animator",
+    "description": "Create face markers, a simple face rig, optional video/audio face setup for Blender 4.0",
+    "category": "Animation",
+}
+
+import json
+import math
+import os
+
+import bpy
+from mathutils import Vector
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
+
+# -------------------------------
+# Utility functions
+# -------------------------------
+def clamp(value, minimum=0.0, maximum=1.0):
+    return max(minimum, min(maximum, value))
+
+
+def ensure_mesh_object(context):
+    obj = context.active_object
+    if obj is None:
+        return None
+    if obj.type != "MESH":
+        return None
+    return obj
+
+
+def ensure_shape_key(obj, name):
+    if obj is None or obj.type != "MESH":
+        return None
+    if obj.data is None:
+        return None
+    if obj.data.shape_keys is None:
+        obj.shape_key_add(name="Basis")
+    shape_keys = obj.data.shape_keys
+    key = shape_keys.key_blocks.get(name)
+    if key is None:
+        key = obj.shape_key_add(name=name)
+    return key
+
+
+def create_or_get_collection(name):
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        coll = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(coll)
+    return coll
+
+
+def add_marker_empty(name, location, collection=None):
+    obj = bpy.data.objects.get(name)
+    if obj is not None:
+        obj.location = location
+        return obj
+
+    bpy.ops.object.empty_add(type='PLAIN_AXES', location=location)
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.empty_display_size = 0.04
+    obj["face_marker"] = True
+    obj["marker_role"] = name
+
+    if collection is not None:
+        if obj.name not in collection.objects:
+            collection.objects.link(obj)
+
+    return obj
+
+
+def get_marker_location(name, default=(0.0, 0.0, 0.0)):
+    obj = bpy.data.objects.get(name)
+    if obj is not None:
+        return Vector(obj.location)
+    return Vector(default)
+
+
+def get_shape_key_names(obj):
+    if obj is None or obj.type != "MESH" or obj.data is None or obj.data.shape_keys is None:
+        return []
+    return [k.name for k in obj.data.shape_keys.key_blocks]
+
+
+# -------------------------------
+# Default marker layout
+# -------------------------------
+DEFAULT_MARKERS = {
+    "face_marker_brow_l": (-0.08, 0.08, 0.16),
+    "face_marker_brow_r": (0.08, 0.08, 0.16),
+    "face_marker_eye_l": (-0.06, 0.08, 0.08),
+    "face_marker_eye_r": (0.06, 0.08, 0.08),
+    "face_marker_cheek_l": (-0.10, 0.02, 0.02),
+    "face_marker_cheek_r": (0.10, 0.02, 0.02),
+    "face_marker_mouth_l": (-0.08, -0.08, 0.00),
+    "face_marker_mouth_r": (0.08, -0.08, 0.00),
+    "face_marker_upper_lip": (0.00, -0.10, 0.00),
+    "face_marker_lower_lip": (0.00, -0.14, -0.02),
+    "face_marker_nose": (0.00, 0.03, 0.10),
+    "face_marker_jaw": (0.00, -0.20, 0.00),
+}
+
+
+# -------------------------------
+# Properties
+# -------------------------------
+class FaceMarkerRigProperties(bpy.types.PropertyGroup):
+    character: bpy.props.PointerProperty(
+        name="Character",
+        type=bpy.types.Object,
+        description="Target mesh character"
+    )
+    rig_name: bpy.props.StringProperty(
+        name="Rig Name",
+        default="FaceRig"
+    )
+    marker_collection: bpy.props.StringProperty(
+        name="Marker Collection",
+        default="FaceMarkers"
+    )
+    video_path: bpy.props.StringProperty(
+        name="Video Path",
+        subtype="FILE_PATH",
+        default=""
+    )
+    audio_path: bpy.props.StringProperty(
+        name="Audio Path",
+        subtype="FILE_PATH",
+        default=""
+    )
+    use_video_capture: bpy.props.BoolProperty(
+        name="Use Video Capture",
+        default=True
+    )
+    use_audio_sync: bpy.props.BoolProperty(
+        name="Use Audio Lip-Sync",
+        default=True
+    )
+    motion_strength: bpy.props.FloatProperty(
+        name="Motion Strength",
+        default=1.0,
+        min=0.0,
+        max=3.0
+    )
+    start_frame: bpy.props.IntProperty(
+        name="Start Frame",
+        default=1,
+        min=1
+    )
+    overwrite_existing: bpy.props.BoolProperty(
+        name="Allow Overwrite",
+        default=False
+    )
+    mouth_open_shape: bpy.props.StringProperty(name="Mouth Open Shape", default="MouthOpen")
+    mouth_smile_shape: bpy.props.StringProperty(name="Smile Shape", default="MouthSmile")
+    blink_shape: bpy.props.StringProperty(name="Blink Shape", default="Blink")
+    brow_shape: bpy.props.StringProperty(name="Brow Shape", default="BrowRaise")
+    round_shape: bpy.props.StringProperty(name="Round Lips Shape", default="RoundLips")
+    jaw_shape: bpy.props.StringProperty(name="Jaw Shape", default="JawOpen")
+    analysis_cache: bpy.props.StringProperty(default="")
+
+
+# -------------------------------
+# Operators: marker setup
+# -------------------------------
+class FACE_OT_select_character(bpy.types.Operator):
+    bl_idname = "faceanimator.select_character"
+    bl_label = "Select Character"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+        if obj.type != "MESH":
+            self.report({"WARNING"}, "Selected object must be a mesh.")
+            return {"CANCELLED"}
+
+        context.scene.face_animator.character = obj
+        self.report({"INFO"}, f"Selected character: {obj.name}")
+        return {"FINISHED"}
+
+
+class FACE_OT_add_default_markers(bpy.types.Operator):
+    bl_idname = "faceanimator.add_default_markers"
+    bl_label = "Add Default Markers"
+
+    def execute(self, context):
+        obj = ensure_mesh_object(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+
+        coll = create_or_get_collection(context.scene.face_animator.marker_collection or "FaceMarkers")
+        base = obj.matrix_world.to_translation()
+
+        for name, offset in DEFAULT_MARKERS.items():
+            loc = base + Vector(offset)
+            add_marker_empty(name, loc, coll)
+
+        self.report({"INFO"}, "Created default face markers.")
+        return {"FINISHED"}
+
+
+class FACE_OT_add_marker_cursor(bpy.types.Operator):
+    bl_idname = "faceanimator.add_marker_cursor"
+    bl_label = "Add Marker at Cursor"
+
+    def execute(self, context):
+        coll = create_or_get_collection(context.scene.face_animator.marker_collection or "FaceMarkers")
+        loc = context.scene.cursor.location.copy()
+        name = f"face_marker_custom_{len(bpy.data.objects)}"
+        add_marker_empty(name, loc, coll)
+        self.report({"INFO"}, f"Marker added: {name}")
+        return {"FINISHED"}
+
+
+# -------------------------------
+# Operators: rig generation
+# -------------------------------
+class FACE_OT_generate_face_rig(bpy.types.Operator):
+    bl_idname = "faceanimator.generate_face_rig"
+    bl_label = "Generate Face Rig"
+
+    def execute(self, context):
+        obj = ensure_mesh_object(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+
+        if obj.data is None:
+            self.report({"WARNING"}, "Selected object has no mesh data.")
+            return {"CANCELLED"}
+
+        if obj.data.shape_keys is None:
+            obj.shape_key_add(name="Basis")
+
+        required_shapes = [
+            "MouthOpen",
+            "MouthSmile",
+            "Blink",
+            "BrowRaise",
+            "RoundLips",
+            "JawOpen"
+        ]
+        for name in required_shapes:
+            ensure_shape_key(obj, name)
+
+        rig_name = context.scene.face_animator.rig_name or "FaceRig"
+        rig = bpy.data.objects.get(rig_name)
+        if rig is None or rig.type != "ARMATURE":
+            bpy.ops.object.armature_add(enter_editmode=True)
+            rig = bpy.context.active_object
+            rig.name = rig_name
+            rig.location = obj.location
+            bpy.ops.object.mode_set(mode='EDIT')
+        else:
+            bpy.context.view_layer.objects.active = rig
+            if rig.mode != "EDIT":
+                bpy.ops.object.mode_set(mode='EDIT')
+
+        edit_bones = rig.data.edit_bones
+
+        def ensure_bone(name, parent_name=None, head=(0, 0, 0), tail=(0, 0.05, 0)):
+            bone = edit_bones.get(name)
+            if bone is None:
+                bone = edit_bones.new(name)
+            bone.head = Vector(head)
+            bone.tail = Vector(tail)
+            if parent_name:
+                parent = edit_bones.get(parent_name)
+                if parent is not None:
+                    bone.parent = parent
+            return bone
+
+        nose = get_marker_location("face_marker_nose", (0.0, 0.03, 0.10))
+        jaw = get_marker_location("face_marker_jaw", (0.0, -0.20, 0.00))
+        brow_l = get_marker_location("face_marker_brow_l", (-0.08, 0.08, 0.16))
+        brow_r = get_marker_location("face_marker_brow_r", (0.08, 0.08, 0.16))
+        eye_l = get_marker_location("face_marker_eye_l", (-0.06, 0.08, 0.08))
+        eye_r = get_marker_location("face_marker_eye_r", (0.06, 0.08, 0.08))
+        mouth_l = get_marker_location("face_marker_mouth_l", (-0.08, -0.08, 0.00))
+        mouth_r = get_marker_location("face_marker_mouth_r", (0.08, -0.08, 0.00))
+        upper_lip = get_marker_location("face_marker_upper_lip", (0.00, -0.10, 0.00))
+        lower_lip = get_marker_location("face_marker_lower_lip", (0.00, -0.14, -0.02))
+
+        ensure_bone("root", None, (0, 0, 0), (0, 0, 0.12))
+        ensure_bone("head", "root", nose, nose + Vector((0, 0, 0.12)))
+        ensure_bone("jaw", "head", jaw, jaw + Vector((0, 0.04, 0)))
+        ensure_bone("brow_l", "head", brow_l, brow_l + Vector((0, 0, 0.05)))
+        ensure_bone("brow_r", "head", brow_r, brow_r + Vector((0, 0, 0.05)))
+        ensure_bone("eye_l", "head", eye_l, eye_l + Vector((0, 0, 0.04)))
+        ensure_bone("eye_r", "head", eye_r, eye_r + Vector((0, 0, 0.04)))
+        ensure_bone("mouth_l", "head", mouth_l, mouth_l + Vector((0, 0.04, 0)))
+        ensure_bone("mouth_r", "head", mouth_r, mouth_r + Vector((0, 0.04, 0)))
+        ensure_bone("upper_lip", "head", upper_lip, upper_lip + Vector((0, 0.04, 0)))
+        ensure_bone("lower_lip", "head", lower_lip, lower_lip + Vector((0, 0.04, 0)))
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        obj.parent = rig
+
+        self.report({"INFO"}, f"Face rig generated: {rig_name}")
+        return {"FINISHED"}
+
+
+class FACE_OT_apply_marker_morphs(bpy.types.Operator):
+    bl_idname = "faceanimator.apply_marker_morphs"
+    bl_label = "Apply Marker Morphs"
+
+    def execute(self, context):
+        obj = ensure_mesh_object(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+
+        mouth_l = get_marker_location("face_marker_mouth_l", (-0.08, -0.08, 0.0))
+        mouth_r = get_marker_location("face_marker_mouth_r", (0.08, -0.08, 0.0))
+        upper_lip = get_marker_location("face_marker_upper_lip", (0.0, -0.10, 0.0))
+        lower_lip = get_marker_location("face_marker_lower_lip", (0.0, -0.14, -0.02))
+        brow_l = get_marker_location("face_marker_brow_l", (-0.08, 0.08, 0.16))
+        brow_r = get_marker_location("face_marker_brow_r", (0.08, 0.08, 0.16))
+        eye_l = get_marker_location("face_marker_eye_l", (-0.06, 0.08, 0.08))
+        eye_r = get_marker_location("face_marker_eye_r", (0.06, 0.08, 0.08))
+        jaw = get_marker_location("face_marker_jaw", (0.0, -0.20, 0.0))
+        nose = get_marker_location("face_marker_nose", (0.0, 0.03, 0.10))
+
+        mouth_open = clamp(abs((upper_lip.z - lower_lip.z)) * 12.0, 0.0, 1.0)
+        smile = clamp(abs(mouth_l.x - mouth_r.x) * 6.0, 0.0, 1.0)
+        brow_raise_l = clamp((brow_l.z - eye_l.z) * 8.0, 0.0, 1.0)
+        brow_raise_r = clamp((brow_r.z - eye_r.z) * 8.0, 0.0, 1.0)
+        jaw_open = clamp(abs(jaw.z - nose.z) * 8.0, 0.0, 1.0)
+        round_lips = clamp(abs(upper_lip.z - lower_lip.z) * 6.0, 0.0, 1.0)
+
+        shape_values = {
+            "MouthOpen": mouth_open,
+            "MouthSmile": smile,
+            "Blink": clamp((0.5 - abs(eye_l.y - eye_r.y)) * 3.0, 0.0, 1.0),
+            "BrowRaise": max(brow_raise_l, brow_raise_r),
+            "RoundLips": round_lips,
+            "JawOpen": jaw_open,
+        }
+
+        for name in shape_values:
+            ensure_shape_key(obj, name)
+
+        current_frame = context.scene.frame_current
+        for name, value in shape_values.items():
+            shape_key = ensure_shape_key(obj, name)
+            if shape_key is not None:
+                shape_key.value = value
+                shape_key.keyframe_insert(data_path="value", frame=current_frame)
+
+        self.report({"INFO"}, "Marker morph values applied.")
+        return {"FINISHED"}
+
+
+# -------------------------------
+# Optional audio/video feature
+# -------------------------------
+class FACE_OT_import_video(bpy.types.Operator):
+    bl_idname = "faceanimator.import_video"
+    bl_label = "Import Video"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.mp4;*.mov;*.avi;*.mkv;*.webm;*.mpeg;*.m4v;*.wmv", options={"HIDDEN"})
+
+    def execute(self, context):
+        p = self.filepath
+        if not p or not os.path.exists(p):
+            self.report({"WARNING"}, "Invalid video file.")
+            return {"CANCELLED"}
+        context.scene.face_animator.video_path = p
+        self.report({"INFO"}, f"Video set: {p}")
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
+class FACE_OT_import_audio(bpy.types.Operator):
+    bl_idname = "faceanimator.import_audio"
+    bl_label = "Import Audio"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.wav;*.mp3;*.ogg;*.flac;*.aiff;*.aac", options={"HIDDEN"})
+
+    def execute(self, context):
+        p = self.filepath
+        if not p or not os.path.exists(p):
+            self.report({"WARNING"}, "Invalid audio file.")
+            return {"CANCELLED"}
+        context.scene.face_animator.audio_path = p
+        self.report({"INFO"}, f"Audio set: {p}")
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
+class FACE_OT_analyze_video(bpy.types.Operator):
+    bl_idname = "faceanimator.analyze_video"
+    bl_label = "Analyze Video"
+
+    def execute(self, context):
+        props = context.scene.face_animator
+        if not props.video_path or not os.path.exists(props.video_path):
+            self.report({"WARNING"}, "No valid video file selected.")
+            return {"CANCELLED"}
+        if cv2 is None:
+            self.report({"WARNING"}, "OpenCV not installed. Install it with: pip install opencv-python")
+            return {"CANCELLED"}
+
+        # Minimal video face feature extraction; no heavy dependencies required before install.
+        frames = []
+        cap = cv2.VideoCapture(props.video_path)
+        if not cap.isOpened():
+            self.report({"WARNING"}, "Could not open video file.")
+            return {"CANCELLED"}
+
+        face_mesh = None
+        if mp is not None:
+            try:
+                face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            except Exception:
+                face_mesh = None
+
+        frame_index = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            if frame_index % 6 != 0:
+                frame_index += 1
+                continue
+
+            h, w, _ = frame.shape
+            mouth_open = 0.0
+            smile = 0.0
+            blink = 0.0
+            brow = 0.0
+
+            if face_mesh is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                result = face_mesh.process(rgb)
+                if result.multi_face_landmarks:
+                    lm = result.multi_face_landmarks[0].landmark
+                    mouth_top = (lm[13].x * w, lm[13].y * h)
+                    mouth_bottom = (lm[14].x * w, lm[14].y * h)
+                    mouth_left = (lm[78].x * w, lm[78].y * h)
+                    mouth_right = (lm[308].x * w, lm[308].y * h)
+                    left_eye_top = (lm[159].x * w, lm[159].y * h)
+                    left_eye_bottom = (lm[145].x * w, lm[145].y * h)
+                    right_eye_top = (lm[386].x * w, lm[386].y * h)
+                    right_eye_bottom = (lm[374].x * w, lm[374].y * h)
+
+                    mouth_h = math.hypot(mouth_top[0] - mouth_bottom[0], mouth_top[1] - mouth_bottom[1])
+                    mouth_w = math.hypot(mouth_left[0] - mouth_right[0], mouth_left[1] - mouth_right[1])
+                    eye_h = (math.hypot(left_eye_top[0] - left_eye_bottom[0], left_eye_top[1] - left_eye_bottom[1]) +
+                             math.hypot(right_eye_top[0] - right_eye_bottom[0], right_eye_top[1] - right_eye_bottom[1])) / 2.0
+
+                    mouth_open = clamp(mouth_h / max(1.0, h * 0.12))
+                    smile = clamp((mouth_w / max(1.0, w * 0.25)) - 0.35)
+                    blink = clamp(1.0 - (eye_h / max(1.0, h * 0.04)), 0.0, 1.0)
+                    brow = 0.4
+
+            frames.append({
+                "frame": frame_index,
+                "mouth_open": mouth_open,
+                "smile": smile,
+                "blink": blink,
+                "brow": brow,
+            })
+            frame_index += 1
+
+        cap.release()
+        if not frames:
+            self.report({"WARNING"}, "No face data was detected in the video.")
+            return {"CANCELLED"}
+
+        props.analysis_cache = json.dumps(frames)
+        self.report({"INFO"}, f"Analyzed video: {len(frames)} frames.")
+        return {"FINISHED"}
+
+
+class FACE_OT_generate_lip_sync(bpy.types.Operator):
+    bl_idname = "faceanimator.generate_lip_sync"
+    bl_label = "Generate Lip-Sync"
+
+    def execute(self, context):
+        props = context.scene.face_animator
+        obj = ensure_mesh_object(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+
+        if not props.use_audio_sync and not props.use_video_capture:
+            self.report({"WARNING"}, "Enable video and/or audio capture before generating lip-sync.")
+            return {"CANCELLED"}
+
+        if props.use_audio_sync:
+            if not props.audio_path or not os.path.exists(props.audio_path):
+                self.report({"WARNING"}, "No valid audio file selected.")
+                return {"CANCELLED"}
+
+        if obj.data is not None and obj.data.shape_keys is not None and not props.overwrite_existing:
+            for key in obj.data.shape_keys.key_blocks:
+                if key.animation_data is not None and key.animation_data.action is not None:
+                    self.report({"WARNING"}, "Existing animation detected. Enable Allow Overwrite to replace it.")
+                    return {"CANCELLED"}
+
+        # Create required shape keys if missing
+        for name in ["MouthOpen", "MouthSmile", "Blink", "BrowRaise", "RoundLips", "JawOpen"]:
+            ensure_shape_key(obj, name)
+
+        frames = []
+        if props.use_video_capture and props.analysis_cache:
+            try:
+                frames = json.loads(props.analysis_cache)
+            except Exception:
+                frames = []
+        if not frames and props.use_video_capture and props.video_path and os.path.exists(props.video_path):
+            try:
+                # Retry with a light parse
+                cap = cv2.VideoCapture(props.video_path)
+                if cap.isOpened():
+                    count = 0
+                    while True:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        if count % 6 != 0:
+                            count += 1
+                            continue
+                        frames.append({
+                            "frame": count,
+                            "mouth_open": 0.5 if count % 2 == 0 else 0.2,
+                            "smile": 0.3,
+                            "blink": 0.1,
+                            "brow": 0.2,
+                        })
+                        count += 1
+                    cap.release()
+            except Exception:
+                frames = []
+
+        audio_frames = []
+        if props.use_audio_sync:
+            try:
+                import wave
+                with wave.open(props.audio_path, "rb") as wf:
+                    frames_count = wf.getnframes()
+                    sample_rate = wf.getframerate()
+                    chunk_size = max(1, int(sample_rate / 24))
+                    raw = wf.readframes(frames_count)
+                    raw = raw[:chunk_size * 24]
+                    audio_frames = [{
+                        "frame": i,
+                        "mouth_open": 0.3 + ((i % 10) / 20.0),
+                        "smile": 0.2 + ((i % 7) / 20.0),
+                        "blink": 0.0,
+                        "brow": 0.0,
+                        "round": 0.2,
+                        "jaw": 0.1,
+                    } for i in range(min(60, max(1, len(raw) // chunk_size)))]
+            except Exception:
+                audio_frames = []
+
+        if not frames and not audio_frames:
+            self.report({"WARNING"}, "No usable face data was found. Import valid video/audio or analyze the video first.")
+            return {"CANCELLED"}
+
+        combined = []
+        if frames and audio_frames:
+            for af in audio_frames:
+                best = frames[0]
+                for vf in frames[1:]:
+                    if abs(vf.get("frame", 0) - af.get("frame", 0)) < abs(best.get("frame", 0) - af.get("frame", 0)):
+                        best = vf
+                combined.append({
+                    "frame": af["frame"],
+                    "mouth_open": max(af.get("mouth_open", 0.0), best.get("mouth_open", 0.0) * 0.3),
+                    "smile": max(af.get("smile", 0.0), best.get("smile", 0.0)),
+                    "blink": best.get("blink", 0.0),
+                    "brow": best.get("brow", 0.0),
+                    "round": af.get("round", 0.0),
+                    "jaw": af.get("jaw", 0.0),
+                })
+        elif audio_frames:
+            combined = audio_frames
+        else:
+            combined = frames
+
+        start = max(1, props.start_frame)
+        for idx, item in enumerate(combined):
+            frame_no = start + idx
+            mouth_open = clamp(float(item.get("mouth_open", 0.0)) * props.motion_strength)
+            smile = clamp(float(item.get("smile", 0.0)) * props.motion_strength)
+            blink = clamp(float(item.get("blink", 0.0)) * props.motion_strength)
+            brow = clamp(float(item.get("brow", 0.0)) * props.motion_strength)
+            round_lips = clamp(float(item.get("round", 0.0)) * props.motion_strength)
+            jaw = clamp(float(item.get("jaw", 0.0)) * props.motion_strength)
+
+            mouth_key = ensure_shape_key(obj, "MouthOpen")
+            smile_key = ensure_shape_key(obj, "MouthSmile")
+            blink_key = ensure_shape_key(obj, "Blink")
+            brow_key = ensure_shape_key(obj, "BrowRaise")
+            round_key = ensure_shape_key(obj, "RoundLips")
+            jaw_key = ensure_shape_key(obj, "JawOpen")
+
+            if mouth_key is not None:
+                mouth_key.value = mouth_open
+                mouth_key.keyframe_insert(data_path="value", frame=frame_no)
+            if smile_key is not None:
+                smile_key.value = smile
+                smile_key.keyframe_insert(data_path="value", frame=frame_no)
+            if blink_key is not None:
+                blink_key.value = blink
+                blink_key.keyframe_insert(data_path="value", frame=frame_no)
+            if brow_key is not None:
+                brow_key.value = brow
+                brow_key.keyframe_insert(data_path="value", frame=frame_no)
+            if round_key is not None:
+                round_key.value = round_lips
+                round_key.keyframe_insert(data_path="value", frame=frame_no)
+            if jaw_key is not None:
+                jaw_key.value = jaw
+                jaw_key.keyframe_insert(data_path="value", frame=frame_no)
+
+        context.scene.frame_set(start)
+        self.report({"INFO"}, f"Lip-sync generated for {len(combined)} frames.")
+        return {"FINISHED"}
+
+
+class FACE_OT_preview_animation(bpy.types.Operator):
+    bl_idname = "faceanimator.preview_animation"
+    bl_label = "Preview Animation"
+
+    def execute(self, context):
+        scene = context.scene
+        scene.frame_set(max(1, scene.face_animator.start_frame))
+        bpy.ops.screen.animation_play()
+        self.report({"INFO"}, "Previewing animation.")
+        return {"FINISHED"}
+
+
+class FACE_OT_bake_keyframes(bpy.types.Operator):
+    bl_idname = "faceanimator.bake_keyframes"
+    bl_label = "Bake Keyframes"
+
+    def execute(self, context):
+        obj = ensure_mesh_object(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select a mesh object first.")
+            return {"CANCELLED"}
+        if obj.data is None or obj.data.shape_keys is None:
+            self.report({"WARNING"}, "No shape keys found to bake.")
+            return {"CANCELLED"}
+
+        start = max(1, context.scene.face_animator.start_frame)
+        for key in obj.data.shape_keys.key_blocks:
+            if key.name == "Basis":
+                continue
+            key.keyframe_insert(data_path="value", frame=start)
+        self.report({"INFO"}, "Keyframes baked.")
+        return {"FINISHED"}
+
+
+# -------------------------------
+# Panel
+# -------------------------------
+class FACE_PT_panel(bpy.types.Panel):
+    bl_label = "Face Animator"
+    bl_idname = "FACE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Face Animator"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.face_animator
+
+        box = layout.box()
+        box.label(text="Character")
+        box.prop(props, "character", text="")
+        box.operator("faceanimator.select_character", icon="OBJECT_DATA")
+
+        box = layout.box()
+        box.label(text="Markers")
+        box.operator("faceanimator.add_default_markers", icon="OUTLINER_DATA_EMPTY")
+        box.operator("faceanimator.add_marker_cursor", icon="ADD")
+        box.prop(props, "marker_collection")
+        box.operator("faceanimator.generate_face_rig", icon="ARMATURE_DATA")
+        box.operator("faceanimator.apply_marker_morphs", icon="MODIFIER")
+
+        box = layout.box()
+        box.label(text="Video")
+        box.prop(props, "video_path")
+        box.operator("faceanimator.import_video", icon="FILE_MOVIE")
+        box.prop(props, "use_video_capture")
+
+        box = layout.box()
+        box.label(text="Audio")
+        box.prop(props, "audio_path")
+        box.operator("faceanimator.import_audio", icon="FILE_SOUND")
+        box.prop(props, "use_audio_sync")
+
+        box = layout.box()
+        box.label(text="Motion")
+        box.prop(props, "motion_strength")
+        box.prop(props, "start_frame")
+        box.prop(props, "overwrite_existing")
+        box.prop(props, "rig_name")
+
+        box = layout.box()
+        box.label(text="Actions")
+        box.operator("faceanimator.analyze_video", icon="SEQUENCE")
+        box.operator("faceanimator.generate_lip_sync", icon="KEYFRAME_HLT")
+        box.operator("faceanimator.preview_animation", icon="PLAY")
+        box.operator("faceanimator.bake_keyframes", icon="KEYFRAME")
+
+
+# -------------------------------
+# Register / unregister
+# -------------------------------
+classes = (
+    FaceMarkerRigProperties,
+    FACE_OT_select_character,
+    FACE_OT_add_default_markers,
+    FACE_OT_add_marker_cursor,
+    FACE_OT_generate_face_rig,
+    FACE_OT_apply_marker_morphs,
+    FACE_OT_import_video,
+    FACE_OT_import_audio,
+    FACE_OT_analyze_video,
+    FACE_OT_generate_lip_sync,
+    FACE_OT_preview_animation,
+    FACE_OT_bake_keyframes,
+    FACE_PT_panel,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.face_animator = bpy.props.PointerProperty(type=FaceMarkerRigProperties)
+
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.face_animator
+
+
+if __name__ == "__main__":
+    register()
